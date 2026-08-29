@@ -3,7 +3,7 @@
 Scan the QR code below to run the app directly on your mobile device:
 
 <p align="center">
-    <img src="https://github.com/ivan-enzhaev/simple-triangle-webgpu-sdl3-cpp/assets/3908473/3dd4e7f3-ca8b-4a65-b3d2-484a4a3f4749" alt="QR Code" width="200">
+    <img src="https://github.com/ivan-enzhaev/simple-triangle-webgpu-sdl3-cpp/assets/3908473/f0f5ec8c-f727-4b0a-b07d-5cb28679b971" alt="QR Code" width="200">
 </p>
 
 ### Downloads
