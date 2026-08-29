@@ -149,6 +149,14 @@ void handle_adapter_request(
 
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 {
+#ifndef __EMSCRIPTEN__
+    if (!SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "60"))
+    {
+        SDL_Log("Failed to set a frame rate: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+#endif
+    
     if (!SDL_Init(SDL_INIT_VIDEO))
         return SDL_APP_FAILURE;
 
