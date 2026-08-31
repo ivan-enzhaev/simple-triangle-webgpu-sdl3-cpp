@@ -18,6 +18,7 @@ dist/
 
 # WebAssembly
 public/js/
+public/app.data
 
 # Config files
 *.ini

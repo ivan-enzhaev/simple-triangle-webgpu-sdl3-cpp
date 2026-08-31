@@ -1,1 +1,0 @@
-emcmake cmake -S . -B dist/web
