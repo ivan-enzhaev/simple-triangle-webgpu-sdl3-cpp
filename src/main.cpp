@@ -21,6 +21,13 @@ static WGPUSurfaceConfiguration config = { 0 };
 static WGPURenderPipeline pipeline = NULL;
 
 static bool is_configured = false;
+static bool need_reconfigure = false;
+static bool need_recreate_surface = false;
+static bool is_in_background = false;
+
+#if defined(SDL_PLATFORM_ANDROID)
+static ANativeWindow *last_native_window = NULL;
+#endif
 
 static const int WIN_WIDTH = 280;
 static const int WIN_HEIGHT = 280;
@@ -78,6 +85,12 @@ static WGPUSurface CreateWGPUSurface(WGPUInstance inst, SDL_Window *win)
 #elif defined(SDL_PLATFORM_ANDROID)
     SDL_PropertiesID props = SDL_GetWindowProperties(win);
     ANativeWindow *aNativeWindow = (ANativeWindow *)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+    if (!aNativeWindow)
+    {
+        return NULL;
+    }
+
+    last_native_window = aNativeWindow;
 
     WGPUSurfaceSourceAndroidNativeWindow androidSource = {
         .chain = { .sType = WGPUSType_SurfaceSourceAndroidNativeWindow },
@@ -85,6 +98,40 @@ static WGPUSurface CreateWGPUSurface(WGPUInstance inst, SDL_Window *win)
     };
     WGPUSurfaceDescriptor desc = { .nextInChain = (WGPUChainedStruct *)&androidSource };
     return wgpuInstanceCreateSurface(inst, &desc);
+
+#elif defined(SDL_PLATFORM_LINUX)
+    SDL_PropertiesID props = SDL_GetWindowProperties(win);
+    const char *driver = SDL_GetCurrentVideoDriver();
+
+    if (driver && SDL_strcmp(driver, "wayland") == 0)
+    {
+        void *wlDisplay = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, NULL);
+        void *wlSurface = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, NULL);
+
+        WGPUSurfaceSourceWaylandSurface waylandSource = {
+            .chain = { .sType = WGPUSType_SurfaceSourceWaylandSurface },
+            .display = wlDisplay,
+            .surface = wlSurface
+        };
+        WGPUSurfaceDescriptor desc = { .nextInChain = (WGPUChainedStruct *)&waylandSource };
+        return wgpuInstanceCreateSurface(inst, &desc);
+    }
+    else if (driver && SDL_strcmp(driver, "x11") == 0)
+    {
+        void *x11Display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, NULL);
+        uint64_t x11Window = (uint64_t)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
+
+        WGPUSurfaceSourceXlibWindow x11Source = {
+            .chain = { .sType = WGPUSType_SurfaceSourceXlibWindow },
+            .display = x11Display,
+            .window = x11Window
+        };
+        WGPUSurfaceDescriptor desc = { .nextInChain = (WGPUChainedStruct *)&x11Source };
+        return wgpuInstanceCreateSurface(inst, &desc);
+    }
+
+    printf("Unsupported Linux SDL video driver: %s\n", driver ? driver : "(null)");
+    return NULL;
 #else
 #error "Platform surface mapping not implemented"
 #endif
@@ -149,20 +196,31 @@ void handle_adapter_request(
 
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 {
-#ifndef __EMSCRIPTEN__
-    if (!SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "60"))
+#if defined(SDL_PLATFORM_LINUX)
+    if (SDL_getenv("WSL_DISTRO_NAME") != NULL)
     {
-        SDL_Log("Failed to set a frame rate: %s", SDL_GetError());
-        return SDL_APP_FAILURE;
+        if (!SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "60"))
+        {
+            SDL_Log("Failed to set a frame rate: %s", SDL_GetError());
+            return SDL_APP_FAILURE;
+        }
     }
 #endif
-    
+
     if (!SDL_Init(SDL_INIT_VIDEO))
         return SDL_APP_FAILURE;
 
     window = SDL_CreateWindow("WebGPU Triangle", WIN_WIDTH, WIN_HEIGHT, SDL_WINDOW_RESIZABLE);
+    if (!window)
+        return SDL_APP_FAILURE;
+
     instance = wgpuCreateInstance(NULL);
+    if (!instance)
+        return SDL_APP_FAILURE;
+
     surface = CreateWGPUSurface(instance, window);
+    if (!surface)
+        return SDL_APP_FAILURE;
 
     WGPURequestAdapterOptions opt = { .compatibleSurface = surface };
 
@@ -189,6 +247,39 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
     {
         return SDL_APP_SUCCESS;
     }
+
+    if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND ||
+        event->type == SDL_EVENT_DID_ENTER_BACKGROUND)
+    {
+        is_in_background = true;
+
+#if defined(SDL_PLATFORM_ANDROID)
+        if (surface)
+        {
+            wgpuSurfaceUnconfigure(surface);
+            wgpuSurfaceRelease(surface);
+            surface = NULL;
+        }
+        last_native_window = NULL;
+#endif
+    }
+    else if (event->type == SDL_EVENT_WILL_ENTER_FOREGROUND ||
+             event->type == SDL_EVENT_DID_ENTER_FOREGROUND)
+    {
+        is_in_background = false;
+#if defined(SDL_PLATFORM_ANDROID)
+        need_recreate_surface = true;
+#else
+        need_reconfigure = true;
+#endif
+    }
+    else if (event->type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED ||
+             event->type == SDL_EVENT_WINDOW_RESIZED ||
+             event->type == SDL_EVENT_WINDOW_RESTORED)
+    {
+        need_reconfigure = true;
+    }
+
     return SDL_APP_CONTINUE;
 }
 
@@ -199,22 +290,73 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         return SDL_APP_CONTINUE;
     }
 
-    if (!is_configured)
+    if (is_in_background || (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED))
     {
-        int w = 0, h = 0;
-        SDL_GetWindowSizeInPixels(window, &w, &h);
-        if (w <= 0 || h <= 0)
+#ifndef __EMSCRIPTEN__
+        SDL_Delay(16);
+#endif
+        return SDL_APP_CONTINUE;
+    }
+
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels(window, &w, &h);
+    if (w <= 0 || h <= 0)
+    {
+#ifndef __EMSCRIPTEN__
+        SDL_Delay(16);
+#endif
+        return SDL_APP_CONTINUE;
+    }
+
+#if defined(SDL_PLATFORM_ANDROID)
+    SDL_PropertiesID props = SDL_GetWindowProperties(window);
+    ANativeWindow *currentNativeWindow = (ANativeWindow *)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+    if (!currentNativeWindow)
+    {
+        SDL_Delay(16);
+        return SDL_APP_CONTINUE;
+    }
+
+    if (!surface || currentNativeWindow != last_native_window)
+    {
+        need_recreate_surface = true;
+    }
+#endif
+
+    if (need_recreate_surface)
+    {
+        if (surface)
         {
-            return SDL_APP_CONTINUE; // Surface isn't ready on Android yet
+            wgpuSurfaceUnconfigure(surface);
+            wgpuSurfaceRelease(surface);
+            surface = NULL;
         }
 
+        surface = CreateWGPUSurface(instance, window);
+        if (!surface)
+        {
+#ifndef __EMSCRIPTEN__
+            SDL_Delay(16);
+#endif
+            return SDL_APP_CONTINUE;
+        }
+
+        need_recreate_surface = false;
+        need_reconfigure = true;
+    }
+
+    if (!surface)
+    {
+        return SDL_APP_CONTINUE;
+    }
+
+    if (!is_configured)
+    {
         queue = wgpuDeviceGetQueue(device);
 
         // Dynamically query supported surface capabilities
         WGPUSurfaceCapabilities caps = { 0 };
         wgpuSurfaceGetCapabilities(surface, adapter, &caps);
-
-        // WGPUTextureFormat surface_format = (caps.formatCount > 0) ? caps.formats[0] : WGPUTextureFormat_BGRA8Unorm;
 
         WGPUTextureFormat surface_format = WGPUTextureFormat_Undefined;
 
@@ -234,17 +376,15 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
         if (surface_format == WGPUTextureFormat_Undefined)
         {
-            surface_format = caps.formats[0];
+            surface_format = (caps.formatCount > 0) ? caps.formats[0] : WGPUTextureFormat_BGRA8Unorm;
         }
-
-        WGPUPresentMode present_mode = (caps.presentModeCount > 0) ? caps.presentModes[0] : WGPUPresentMode_Fifo;
 
         config.device = device;
         config.format = surface_format;
         config.usage = WGPUTextureUsage_RenderAttachment;
         config.width = (uint32_t)w;
         config.height = (uint32_t)h;
-        config.presentMode = present_mode;
+        config.presentMode = WGPUPresentMode_Fifo;
         wgpuSurfaceConfigure(surface, &config);
 
         wgpuSurfaceCapabilitiesFreeMembers(caps);
@@ -277,23 +417,61 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         wgpuShaderModuleRelease(shader_module);
 
         is_configured = true;
+        need_reconfigure = false;
         printf("WebGPU Device/Queue ready and Surface configured.\n");
+    }
+    else if (need_reconfigure || config.width != (uint32_t)w || config.height != (uint32_t)h)
+    {
+        config.width = (uint32_t)w;
+        config.height = (uint32_t)h;
+        wgpuSurfaceConfigure(surface, &config);
+        need_reconfigure = false;
     }
 
     WGPUSurfaceTexture surfaceTexture = { 0 };
     wgpuSurfaceGetCurrentTexture(surface, &surfaceTexture);
 
-#if defined(WGPUSurfaceGetCurrentTextureStatus_Success) && defined(WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal)
-#define SURFACE_STATUS_SUCCESS(s) ((s) == WGPUSurfaceGetCurrentTextureStatus_Success || (s) == WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal)
-#elif defined(WGPUSurfaceGetCurrentTextureStatus_SuccessStatus)
-#define SURFACE_STATUS_SUCCESS(s) ((s) == WGPUSurfaceGetCurrentTextureStatus_SuccessStatus)
-#else
-#define SURFACE_STATUS_SUCCESS(s) ((s) == 0 || (s) == 1)
-#endif
-
-    if (!SURFACE_STATUS_SUCCESS(surfaceTexture.status))
+    if (surfaceTexture.status == WGPUSurfaceGetCurrentTextureStatus_Outdated ||
+        surfaceTexture.status == WGPUSurfaceGetCurrentTextureStatus_Lost)
     {
+        if (surfaceTexture.texture)
+        {
+            wgpuTextureRelease(surfaceTexture.texture);
+        }
+#if defined(SDL_PLATFORM_ANDROID)
+        if (surfaceTexture.status == WGPUSurfaceGetCurrentTextureStatus_Lost)
+        {
+            need_recreate_surface = true;
+        }
+        else
+        {
+            need_reconfigure = true;
+        }
+#else
+        need_reconfigure = true;
+#endif
+#ifndef __EMSCRIPTEN__
+        SDL_Delay(1);
+#endif
         return SDL_APP_CONTINUE;
+    }
+
+    if (surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal &&
+        surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal)
+    {
+        if (surfaceTexture.texture)
+        {
+            wgpuTextureRelease(surfaceTexture.texture);
+        }
+#ifndef __EMSCRIPTEN__
+        SDL_Delay(1);
+#endif
+        return SDL_APP_CONTINUE;
+    }
+
+    if (surfaceTexture.status == WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal)
+    {
+        need_reconfigure = true;
     }
 
     WGPUTextureView view = wgpuTextureCreateView(surfaceTexture.texture, NULL);
@@ -347,8 +525,6 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         wgpuTextureRelease(surfaceTexture.texture);
     }
 
-#undef SURFACE_STATUS_SUCCESS
-
     return SDL_APP_CONTINUE;
 }
 
@@ -370,5 +546,22 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
         wgpuInstanceRelease(instance);
     if (window)
         SDL_DestroyWindow(window);
+
+    pipeline = NULL;
+    queue = NULL;
+    device = NULL;
+    adapter = NULL;
+    surface = NULL;
+    instance = NULL;
+    window = NULL;
+    config = (WGPUSurfaceConfiguration){ 0 };
+    is_configured = false;
+    need_reconfigure = false;
+    need_recreate_surface = false;
+    is_in_background = false;
+#if defined(SDL_PLATFORM_ANDROID)
+    last_native_window = NULL;
+#endif
+
     SDL_Quit();
 }
