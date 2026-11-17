@@ -3,10 +3,40 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        .canvas-container {
+            position: relative;
+            display: inline-block;
+        }
+
+        #canvas {
+            display: block;
+        }
+
+        .repo-link {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            margin: 0;
+            z-index: 10;
+            font-family: sans-serif;
+            font-size: 13px;
+        }
+
+        .repo-link a {
+            color: #fff;
+        }
+    </style>
 </head>
 
 <body>
-    <canvas id="canvas"></canvas>
+    <div class="canvas-container">
+        <canvas id="canvas"></canvas>
+
+        <p class="repo-link">
+            <a href="https://github.com/ivan-enzhaev/simple-triangle-webgpu-sdl3-cpp" target="_blank" rel="noopener noreferrer">GitHub repository</a>
+        </p>
+    </div>
 
     <script>
         console.log("HTML loaded");
